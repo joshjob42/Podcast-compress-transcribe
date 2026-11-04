@@ -138,6 +138,11 @@ def jobs(podcast_uuid=None):
                   key=lambda j: -j["created"])
 
 
+def active_ids():
+    """The episodes of unfinished jobs (the hub's disk cap leaves them alone: they're counted, and their ads are due)."""
+    return {e["id"] for j in jobs() if j["state"] not in FINAL for e in j["episodes"]}
+
+
 def get(job_id):
     return _jobs.get(job_id)
 

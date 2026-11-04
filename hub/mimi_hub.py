@@ -129,6 +129,7 @@ os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(Path(os.environ.get("MIMI_H
 DATA = Path(os.environ.get("MIMI_HUB_DATA", ROOT / "hub_data"))
 DEVICE = os.environ.get("MIMI_HUB_DEVICE", "auto")
 SOURCES = os.environ.get("MIMI_HUB_SOURCES", "fetch")  # fetch | keep (the originals of keep_source episodes)
+MAX_BYTES = int(float(os.environ.get("MIMI_HUB_DATA_MAX_GB", "0")) * 1e9)  # 0: no cap (trim_data)
 COMPRESS = os.environ.get("MIMI_HUB_COMPRESS", "1") != "0"  # 0: no .mimi, transcripts + ad segments only
 TOKEN = os.environ.get("MIMI_HUB_TOKEN", "")
 ASR_MODEL = os.environ.get("MIMI_HUB_ASR", "nemo-parakeet-tdt-0.6b-v2")  # -v3 for multilingual
@@ -253,6 +254,108 @@ def get_source(i, r):
     path = DATA / f"{i}.src"
     update(i, source_ready=True, source_type=ctype, source_bytes=path.stat().st_size, source_url=u)
     return str(path)
+
+
+# MIMI_HUB_DATA_MAX_GB caps the data directory, checked once a minute. Past it the originals go first, then whole
+# episodes, the least recently served first in each. An episode with a .mimi only loses its .src: the .mimi is ours, and
+# at ~2 MB per hour removing it frees little and costs a conversion, so those go last. A transcript-only episode goes
+# entirely (audio, transcript, ad marks, summary, record): kept data without the audio it was made from is of little
+# use, since dynamically inserted ads mean the publisher's file has usually changed by the time it's asked for again.
+# Removed, an episode asked for again is simply processed afresh, from the file the client gets. Untouched: episodes
+# queued, being processed, waiting for their ad marks or summary, or in an unfinished backlog, and uploads (no URL to
+# get them from again).
+TRIM_EVERY_S = 60
+_trim_stuck = [False]  # over the cap with nothing left to remove (said once)
+
+
+def _data_bytes():
+    total = 0
+    for f in DATA.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:  # deleted meanwhile
+            pass
+    return total
+
+
+def _trimmable(r, backlogs):
+    return (r.get("state") in ("ready", "failed") and not r.get("upload") and r["id"] not in backlogs
+            and r.get("segments_state") != "pending" and r.get("summary_state") != "pending"
+            and not r.get("source_fetching")
+            # (converted in bulk by hand: scripts/backlog_ads.py is still to find its ads)
+            and not (r.get("batch") and r.get("segments_state") not in ("ready", "off")))
+
+
+def _mark_served(i, r):
+    """For trim_data's order (least recently served first); at most once an hour per episode."""
+    if MAX_BYTES and r and time.time() - (r.get("served") or 0) > 3600:
+        with lock:
+            if r := load(i):
+                save(dict(r, served=time.time()))
+
+
+def _remove(files):
+    """The bytes freed."""
+    freed = 0
+    for f in files:
+        try:
+            size = f.stat().st_size
+            f.unlink()
+            freed += size
+        except OSError:
+            pass
+    return freed
+
+
+def trim_data():
+    used = start_bytes = _data_bytes()
+    if used <= MAX_BYTES:
+        _trim_stuck[0] = False
+        return
+    from hub import backlog
+    backlogs, todo = backlog.active_ids(), []  # todo: (0: its original | 1: the whole episode, last served, id)
+    for f in record_paths():
+        try:
+            r = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if _trimmable(r, backlogs):
+            when = r.get("served") or r.get("created") or 0
+            if (DATA / f"{r['id']}.src").exists():
+                todo.append((0, when, r["id"]))
+            if r["state"] == "ready":
+                todo.append((1, when, r["id"]))
+    originals = episodes = 0
+    for whole, _, i in sorted(todo):
+        if used <= MAX_BYTES:
+            break
+        with lock:  # still removable (not re-queued since)
+            r = load(i)
+            if not r or not _trimmable(r, backlogs):
+                continue
+            if not whole and (r["state"] != "ready" or (DATA / f"{i}.mimi").exists()):
+                used -= _remove([DATA / f"{i}.src"])  # .src now re-fetches from source_url, as with SOURCES=fetch
+                originals += 1
+            else:  # the record first: a record means its files are there
+                used -= _remove([rec_path(i), *DATA.glob(f"{i}.*")])
+                episodes += 1
+    stuck = used > MAX_BYTES
+    if originals or episodes or (stuck and not _trim_stuck[0]):
+        print(f"disk: data over the {MAX_BYTES / 1e9:g} GB cap; removed {originals} originals and {episodes} episodes "
+              f"({(start_bytes - used) / 1e9:.1f} GB), now {used / 1e9:.1f} GB" + (
+                  ": still over (the rest are uploads, in a backlog, queued or being processed)" if stuck else ""),
+              flush=True)
+    _trim_stuck[0] = stuck
+
+
+def trim_worker():
+    while True:
+        try:
+            trim_data()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(TRIM_EVERY_S)
 
 
 # A client about to download an episode (priority 0) waits a few minutes for its source, and processing may be hours
@@ -1835,6 +1938,8 @@ def start():
     backlog.start()
     for k in range(2):
         threading.Thread(target=source_worker, daemon=True, name=f"mimi-source-{k}").start()
+    if MAX_BYTES:
+        threading.Thread(target=trim_worker, daemon=True, name="mimi-trim").start()
     if PRELOAD:
         threading.Thread(target=warm, daemon=True, name="mimi-warm").start()
 
@@ -2190,6 +2295,7 @@ def episode(name: str, request: Request, authorization: str | None = Header(None
     if ext == "src":
         r = load(stem)
         p = DATA / f"{stem}.src"
+        _mark_served(stem, r)
         if r and p.exists():  # kept, or still being processed
             return FileResponse(p, media_type=r.get("source_type") or "audio/mpeg", filename=f"{stem}.src")
         if not r or not r.get("source_ready") or not r.get("source_url"):
@@ -2199,6 +2305,7 @@ def episode(name: str, request: Request, authorization: str | None = Header(None
         p = DATA / f"{stem}.{ext}"
         if not p.exists():
             raise HTTPException(404, "not ready")
+        _mark_served(stem, load(stem))
         return FileResponse(p, media_type="audio/x-mimi" if ext == "mimi" else "text/vtt",
                             filename=f"{stem}.{ext}")
     r = load(stem)
