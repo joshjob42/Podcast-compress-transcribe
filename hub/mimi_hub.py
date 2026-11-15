@@ -257,22 +257,30 @@ def get_source(i, r):
 
 
 # MIMI_HUB_DATA_MAX_GB caps the data directory, checked once a minute. Past it the originals go first, then whole
-# episodes, the least recently served first in each. An episode with a .mimi only loses its .src: the .mimi is ours, and
-# at ~2 MB per hour removing it frees little and costs a conversion, so those go last. A transcript-only episode goes
-# entirely (audio, transcript, ad marks, summary, record): kept data without the audio it was made from is of little
-# use, since dynamically inserted ads mean the publisher's file has usually changed by the time it's asked for again.
-# Removed, an episode asked for again is simply processed afresh, from the file the client gets. Untouched: episodes
+# episodes, the least recently served first in each. An episode only loses its .src at first: what's left is small (a
+# transcript-only episode's transcript, ad marks and summary: well under 1 MB) and still right for the phones that
+# downloaded our copy of that audio. Removed entirely, a downloaded episode played later got marks made afresh from the
+# publisher's current file, whose dynamically inserted ads have usually moved: marks in the wrong places. Without its
+# .src, an episode asked for again is fetched from the publisher (409 if the file changed). .mimi episodes go last: the
+# .mimi is ours, and at ~2 MB per hour removing it frees little and costs a conversion. Untouched: episodes
 # queued, being processed, waiting for their ad marks or summary, or in an unfinished backlog, and uploads (no URL to
 # get them from again).
 TRIM_EVERY_S = 60
 _trim_stuck = [False]  # over the cap with nothing left to remove (said once)
 
 
+def _scratch(f):
+    """Files that are only there while something runs (and, after a crash, until the next start): the audio handed to
+    the diarizer, writes in progress. Not counted against the cap: a crash mid-diarization of a 4-hour episode left a
+    1 GB one behind, and the cap removed a gigabyte of episodes to make room for it."""
+    return (f.name.startswith("tmp") and f.suffix == ".npy") or f.suffix == ".tmp"
+
+
 def _data_bytes():
     total = 0
     for f in DATA.rglob("*"):
         try:
-            if f.is_file():
+            if f.is_file() and not _scratch(f):
                 total += f.stat().st_size
         except OSError:  # deleted meanwhile
             pass
@@ -334,7 +342,7 @@ def trim_data():
             r = load(i)
             if not r or not _trimmable(r, backlogs):
                 continue
-            if not whole and (r["state"] != "ready" or (DATA / f"{i}.mimi").exists()):
+            if not whole:
                 used -= _remove([DATA / f"{i}.src"])  # .src now re-fetches from source_url, as with SOURCES=fetch
                 originals += 1
             else:  # the record first: a record means its files are there
@@ -1907,6 +1915,9 @@ _procs = None
 
 @app.on_event("startup")
 def start():
+    for f in DATA.iterdir():  # a crash's leftovers (nothing runs yet)
+        if f.is_file() and _scratch(f):
+            f.unlink(missing_ok=True)
     for p in sorted(record_paths(), key=lambda p: p.stat().st_mtime):
         r = json.loads(p.read_text())
         if r["state"] not in ("ready", "failed"):  # resume interrupted jobs from scratch

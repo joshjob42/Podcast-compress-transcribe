@@ -36,14 +36,14 @@ def reset():
             p.unlink()
 
 
-# originals go first, oldest first, and a .mimi episode keeps the rest; a transcript-only episode goes entirely
+# originals go first, oldest first; the episode keeps the rest (marks still right for our copy on phones)
 episode("old_mimi", 90, mimi=2000)
 episode("both", 50, src=8000, mimi=2000, keep_source=True, compressed=True, source_ready=True, source_url="http://x/a")
 episode("only_src", 40, src=8000, keep_source=True, compressed=False)
 episode("new_src", 30, src=3000, keep_source=True, compressed=False)
 hub.trim_data()
 assert files() == ["both.json", "both.mimi", "both.vtt", "new_src.json", "new_src.src", "new_src.vtt", "old_mimi.json",
-                   "old_mimi.mimi", "old_mimi.vtt"], files()
+                   "old_mimi.mimi", "old_mimi.vtt", "only_src.json", "only_src.vtt"], files()
 
 # .mimi episodes only once no original is left, least recently served first
 reset()
@@ -51,10 +51,11 @@ episode("a", 90, mimi=4000, served=now - 10)
 episode("b", 80, mimi=4000)
 episode("c", 70, src=6000, keep_source=True, compressed=False)
 hub.trim_data()
-assert not (DATA / "c.json").exists() and (DATA / "a.mimi").exists() and (DATA / "b.mimi").exists(), files()
+assert not (DATA / "c.src").exists() and (DATA / "c.json").exists() and (DATA / "a.mimi").exists(), files()
+assert (DATA / "b.mimi").exists(), files()
 episode("d", 60, mimi=4000)
 hub.trim_data()
-assert not (DATA / "b.json").exists() and (DATA / "a.mimi").exists(), files()
+assert not (DATA / "b.json").exists() and (DATA / "a.mimi").exists() and (DATA / "c.json").exists(), files()
 
 # left alone: still being worked on, uploads, what a backlog or scripts/backlog_ads.py hasn't finished
 reset()
@@ -80,6 +81,19 @@ reset()
 episode("failed", 90, src=20000, state="failed", error="x")
 hub.trim_data()
 assert not (DATA / "failed.src").exists() and (DATA / "failed.json").exists(), files()
+
+# a crash's temp files don't count against the cap, and go at startup
+reset()
+episode("keep", 90, mimi=9000)
+(DATA / "tmpabc123.npy").write_bytes(b"x" * 50000)
+(DATA / "keep.segments.json.tmp").write_bytes(b"x" * 5000)
+hub.trim_data()
+assert (DATA / "keep.mimi").exists(), files()
+hub._trim_stuck[0] = False
+for f in DATA.iterdir():
+    if f.is_file() and hub._scratch(f):
+        f.unlink()
+assert files() == ["keep.json", "keep.mimi", "keep.vtt"], files()
 
 # served: any read of the audio or transcript counts, once an hour; a removed episode is no error
 reset()
